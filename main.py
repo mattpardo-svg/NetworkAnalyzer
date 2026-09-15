@@ -69,6 +69,7 @@ def main():
     (
         lines_cmp, transformers_cmp, transformers3_cmp,
         final_lines_id, final_tr_id, final_tr3_id,
+        single_sided_elements,
     ) = loadflow.build_base_case_comparison(
         limits, hv_lines, hv_transformers, hv_transformers3,
         ac_ln_i, ac_tr_i, ac_tr3_i,
@@ -85,6 +86,10 @@ def main():
         "Base Case (N-0)", base_case_comparison, id_col=pd.Series(base_case_df.index, index=base_case_df.index),
         side_col=base_case_df["Binding Side"],
     )
+    # Workbook only: a note on the input ratings, not a KPI, so it is not logged.
+    kpi_rows += kpis.overall_rows("Base Case (N-0)", {
+        "Elements Rated on One Side Only": len(single_sided_elements),
+    })
 
     # --- Sensitivity analysis (optional) ---
     if config.Sens:
