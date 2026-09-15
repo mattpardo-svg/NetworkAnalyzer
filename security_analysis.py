@@ -95,6 +95,14 @@ def build_shortlist_and_full_comparison(limits, sides_ac, network, element_info)
         network.get_lines()[["i1", "i2"]].rename(columns={"i1": "ONE", "i2": "TWO"}),
         network.get_2_windings_transformers()[["i1", "i2"]].rename(columns={"i1": "ONE", "i2": "TWO"}),
     ]).stack().rename("i").reset_index().rename(columns={"level_0": "subject_id", "level_1": "side"})
+
+    # 3-winding transformers are stacked on their own: concatenated with the two-sided frames
+    # above they would give every line a THREE column, and stack() keeps those empty rows.
+    base_i3 = network.get_3_windings_transformers()[["i1", "i2", "i3"]].rename(
+        columns={"i1": "ONE", "i2": "TWO", "i3": "THREE"},
+    ).stack().rename("i").reset_index().rename(columns={"level_0": "subject_id", "level_1": "side"})
+
+    base_i = pd.concat([base_i, base_i3], ignore_index=True)
     base_i["contingency_id"] = None  # N-state
 
     sides_ac_all = pd.concat([base_i, sides_ac], ignore_index=True)

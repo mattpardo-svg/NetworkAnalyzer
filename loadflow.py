@@ -35,14 +35,22 @@ def run_dc(network):
     return dc_result, dc_lf_time
 
 
+def _by_side(current_per_side):
+    """Turn {side: current per element} into one row per (element_id, side)."""
+    return (
+        pd.DataFrame(current_per_side)
+        .rename_axis(index="element_id", columns="side")
+        .stack()
+    )
+
+
 def branch_current(elements_df):
     """AC current (A) per side, as left on the network by the AC load flow.
 
-    One column per side the element carries (ONE/TWO, plus THREE for 3-winding
-    transformers), so the base case can compare each side against its own thermal limit
-    instead of assuming side ONE is the binding one.
+    One row per (element, side) - the shape security_analysis.branch_results() uses - so
+    each side can be compared against its own thermal limit.
     """
-    return pd.DataFrame({
+    return _by_side({
         side: elements_df[f"i{suffix}"].abs()
         for side, suffix in SIDE_COLUMN_SUFFIX.items() if f"i{suffix}" in elements_df
     })
@@ -54,7 +62,7 @@ def branch_current_dc(elements_df, voltage_levels):
     The DC load flow leaves i1/q1 unset on the network, so the current is derived from
     the nominal voltage of each side - the same convention pypowsybl uses for DC
     security-analysis branch results, which keeps the base case comparable with the SA
-    dataset.
+    dataset. Each side is taken separately because each carries its own voltage level.
     """
     currents = {}
     for side, suffix in SIDE_COLUMN_SUFFIX.items():
@@ -62,24 +70,7 @@ def branch_current_dc(elements_df, voltage_levels):
             continue
         nominal_v = elements_df[f"voltage_level{suffix}_id"].map(voltage_levels["nominal_v"])
         currents[side] = elements_df[f"p{suffix}"].abs().mul(1000).div(np.sqrt(3) * nominal_v)
-    return pd.DataFrame(currents)
-
-
-def _side_loadings(ac_currents, patl_per_side):
-    """AC loading (%) on every side for which the element has both a current and a PATL."""
-    patl_per_side = patl_per_side.reindex(ac_currents.index)
-    sides = [side for side in SIDE_COLUMN_SUFFIX
-             if side in ac_currents.columns and side in patl_per_side.columns]
-    return pd.DataFrame(
-        {side: ac_currents[side].div(patl_per_side[side]).mul(100) for side in sides},
-        index=ac_currents.index,
-    )
-
-
-def _pick_side(per_side, binding_side):
-    """Take one value per element, from the side named for that element."""
-    pairs = pd.MultiIndex.from_arrays([binding_side.index, binding_side.to_numpy()])
-    return per_side.stack().reindex(pairs).set_axis(binding_side.index)
+    return _by_side(currents)
 
 
 def _compare_ac_dc(ac_currents, dc_currents, patl_per_side, name_lookup, active_threshold_pct,
@@ -93,46 +84,37 @@ def _compare_ac_dc(ac_currents, dc_currents, patl_per_side, name_lookup, active_
     between two terminals. An element rated on one side only has that side as its binding
     side. AC LF / DC LF / PATL are all currents in A; the % columns are loadings in %.
     """
-    loadings = _side_loadings(ac_currents, patl_per_side)
-    rated = loadings.dropna(how="all")  # an element with no PATL on any side cannot be assessed
-    binding_side = rated.idxmax(axis=1) if not rated.empty else pd.Series(dtype=object)
+    per_side = pd.DataFrame(index=ac_currents.index)
+    per_side["AC LF"] = ac_currents
+    per_side["DC LF"] = dc_currents
+    per_side["PATL"] = patl_per_side
+    per_side["AC LF %"] = per_side["AC LF"].div(per_side["PATL"]).mul(100)
 
-    for element_id in ac_currents.index.difference(binding_side.index):
-        name = name_lookup.loc[element_id]["name"] if element_id in name_lookup.index else ""
-        logger.warning("No PATL found for %s: %s (%s)", kind_label, element_id, name)
+    # A side with no rating, or no current, has no loading to rank it by.
+    ranked = per_side.dropna(subset=["AC LF %"])
+    binding_side = ranked.groupby(level="element_id")["AC LF %"].idxmax()
 
-    comparison = pd.DataFrame({
-        "AC LF": _pick_side(ac_currents, binding_side),
-        "DC LF": _pick_side(dc_currents, binding_side),
-        "PATL": _pick_side(patl_per_side.reindex(ac_currents.index), binding_side),
-        "Binding Side": binding_side,
-    })
-    comparison["AC LF %"] = comparison["AC LF"].div(comparison["PATL"]).mul(100)
+    elements = ac_currents.index.get_level_values("element_id").unique()
+    comparison = ranked.loc[list(binding_side)].reset_index("side").rename(
+        columns={"side": "Binding Side"},
+    )
+    comparison = comparison.reindex(elements[elements.isin(comparison.index)])
+    comparison = comparison[["AC LF", "DC LF", "PATL", "Binding Side", "AC LF %"]]
     comparison["DC LF %"] = comparison["DC LF"].div(comparison["PATL"]).mul(100)
     comparison["(DC-AC)/AC %"] = (
         (comparison["DC LF"].sub(comparison["AC LF"])).div(comparison["AC LF"])
     ).mul(100).fillna(0)
 
-    _log_binding_sides(kind_label, comparison, loadings)
+    for element_id in elements.difference(comparison.index):
+        name = name_lookup.loc[element_id]["name"] if element_id in name_lookup.index else ""
+        logger.warning("No PATL found for %s: %s (%s)", kind_label, element_id, name)
+
+    if not comparison.empty:
+        logger.info("Binding side for %s: %s", kind_label,
+                    comparison["Binding Side"].value_counts().to_dict())
 
     active_comparison = comparison[comparison["AC LF %"] > active_threshold_pct]
-    return active_comparison, binding_side.index.tolist()
-
-
-def _log_binding_sides(kind_label, comparison, loadings):
-    """Report which side ended up binding, and what side ONE alone would have got wrong."""
-    if comparison.empty:
-        return
-    side_one = loadings["ONE"].reindex(comparison.index) if "ONE" in loadings.columns else None
-    understated = (comparison["AC LF %"] - side_one).dropna() if side_one is not None else pd.Series(dtype=float)
-    logger.info(
-        "Binding side for %s: %s | vs side ONE alone: %d of %d element(s) understated by up "
-        "to %.2f pp, %d element(s) would have had no rating at all",
-        kind_label, comparison["Binding Side"].value_counts().to_dict(),
-        int((understated > 1e-9).sum()), len(comparison),
-        understated.max() if not understated.empty else 0.0,
-        int(side_one.isna().sum()) if side_one is not None else len(comparison),
-    )
+    return active_comparison, comparison.index.tolist()
 
 
 def build_base_case_comparison(limits, hv_lines, hv_transformers, hv_transformers3,
@@ -140,17 +122,15 @@ def build_base_case_comparison(limits, hv_lines, hv_transformers, hv_transformer
                                 dc_ln_i, dc_tr_i, dc_tr3_i):
     """Build the three base-case (N-0) AC vs DC comparison dataframes (lines, 2W-TR, 3W-TR).
 
-    The ac_*/dc_* frames carry one current (A) per side; each element is then reported on
-    its binding side, against that side's own CURRENT PATL. CIM current limits are
-    terminal-specific, so a branch can be rated differently on each side - a transformer
+    The ac_*/dc_* series carry one current (A) per (element, side); each element is then
+    reported on its binding side, against that side's own CURRENT PATL. CIM current limits
+    are terminal-specific, so a branch can be rated differently on each side - a transformer
     most of all, where the two ratings express the same MVA at different voltages - and
     side ONE is not reliably the side that binds.
     """
     patl = limits[(limits["acceptable_duration"] == -1) & (limits["type"] == "CURRENT")]
-    # One column per side; the most restrictive rating wins if a side carries several.
-    patl_per_side = patl.pivot_table(
-        index="element_id", columns="side", values="value", aggfunc="min",
-    )
+    # One PATL per (element, side); the most restrictive rating wins if a side carries several.
+    patl_per_side = patl.groupby(["element_id", "side"])["value"].min()
 
     lines_cmp, final_lines_id = _compare_ac_dc(
         ac_ln_i, dc_ln_i, patl_per_side, hv_lines, config.BASE_CASE_ACTIVE_THRESHOLD_PCT, "line",
@@ -164,7 +144,22 @@ def build_base_case_comparison(limits, hv_lines, hv_transformers, hv_transformer
         "3-winding transformer",
     )
 
+    assessed = final_lines_id + final_tr_id + final_tr3_id
+    single_sided = _single_sided_elements(patl_per_side, assessed)
+
     return (
         lines_cmp, transformers_cmp, transformers3_cmp,
         final_lines_id, final_tr_id, final_tr3_id,
+        single_sided,
     )
+
+
+def _single_sided_elements(patl_per_side, assessed):
+    """The assessed elements carrying a CURRENT PATL on one side only.
+
+    A data-quality note about the ratings in the input: such an element has no second side to
+    compare, so its binding side is decided by the data rather than by the load flow. Counted
+    over the elements the base case assessed, before the loading threshold is applied.
+    """
+    rated_sides = patl_per_side.groupby(level="element_id").size().reindex(assessed)
+    return rated_sides[rated_sides == 1].index.tolist()
