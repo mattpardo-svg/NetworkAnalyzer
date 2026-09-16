@@ -129,6 +129,16 @@ def rmse_per_contingency(comparison: pd.DataFrame, group_col: pd.Series) -> pd.S
     return squared_error.groupby(groups).mean().pow(0.5).sort_values(ascending=False)
 
 
+def max_error_per_contingency(comparison: pd.DataFrame, group_col: pd.Series) -> pd.Series:
+    """MaxError_per_CO: the largest absolute error (A) in one contingency group, worst first.
+
+    Additive to the overall maximum and to the element/contingency that attained it: the
+    single worst mismatch says nothing about how the rest of the contingencies behave.
+    """
+    groups = _contingency_groups(comparison, group_col)
+    return comparison["abs_error"].groupby(groups).max().sort_values(ascending=False)
+
+
 def loading_limit_kpis(comparison: pd.DataFrame) -> dict:
     """Signed loading-% deviation and margin error (A), overall and near the thermal limit."""
     kpis = {
@@ -190,6 +200,57 @@ def violation_kpis(comparison: pd.DataFrame) -> dict:
     }
 
 
+def violation_counts_per_contingency(comparison: pd.DataFrame, violation: dict,
+                                      group_col: pd.Series) -> dict:
+    """False negative and false positive counts within each contingency group, worst first.
+
+    Every group is listed, the zeros included: unlike the severity volumes below, these
+    counts are the populations the per-CO rates are built on, so a group DC got right is
+    a result to read and not an absence.
+    """
+    groups = _contingency_groups(comparison, group_col)
+    return {
+        "False Negatives": (
+            violation["_false_negatives_mask"].groupby(groups).sum().sort_values(ascending=False)
+        ),
+        "False Positives": (
+            violation["_false_positives_mask"].groupby(groups).sum().sort_values(ascending=False)
+        ),
+    }
+
+
+def violation_rates_per_contingency(comparison: pd.DataFrame, violation: dict,
+                                     group_col: pd.Series) -> dict:
+    """Missed overload and false alarm rate within each contingency group, worst first.
+
+    Each rate is computed inside its own group, against that group's own denominator: the
+    AC violations it holds for the missed overload rate, the AC-secure observations for the
+    false alarm rate. A group whose denominator is empty has no rate - not a rate of zero -
+    so it is excluded and counted, as the Top-N overlap does for groups it cannot rank. The
+    excluded groups are returned under `_excluded_groups` for reporting.
+    """
+    groups = _contingency_groups(comparison, group_col)
+    ac_violation = comparison["ac_violation"]
+
+    def _rate_per_group(hits, population):
+        denominator = population.groupby(groups).sum()
+        defined = denominator > 0
+        rate = hits.groupby(groups).sum()[defined] / denominator[defined]
+        return rate.sort_values(ascending=False), list(denominator.index[~defined])
+
+    missed_rate, missed_excluded = _rate_per_group(violation["_false_negatives_mask"], ac_violation)
+    false_rate, false_excluded = _rate_per_group(violation["_false_positives_mask"], ~ac_violation)
+
+    return {
+        "Missed Overload Rate": missed_rate,
+        "False Alarm Rate": false_rate,
+        "_excluded_groups": {
+            "Missed Overload Rate - Contingency Groups Excluded (no AC violation)": missed_excluded,
+            "False Alarm Rate - Contingency Groups Excluded (no AC-secure observation)": false_excluded,
+        },
+    }
+
+
 def severity_kpis(comparison: pd.DataFrame, violation: dict) -> dict:
     """Volume (sum) and average severity of missed/false overloads.
 
@@ -237,6 +298,42 @@ def severity_volumes_per_contingency(comparison: pd.DataFrame, violation: dict,
         ),
         "False Overload Volume (A)": (
             false_overload.groupby(groups.loc[false.index]).sum().sort_values(ascending=False)
+        ),
+    }
+
+
+def severity_averages_per_contingency(comparison: pd.DataFrame, violation: dict,
+                                       group_col: pd.Series) -> dict:
+    """Average severity of the missed/false overloads within each contingency group, worst first.
+
+    Both readings of the KPI are kept per CO exactly as they are overall: the loading of the
+    affected cases (%) and the overload magnitude above the limit (A). As with the volumes
+    above, only the contingencies that carry a false negative (resp. false positive) appear -
+    a group with none has no cases to average.
+    """
+    groups = _contingency_groups(comparison, group_col)
+
+    missed = comparison.loc[violation["_false_negatives_mask"]]
+    false = comparison.loc[violation["_false_positives_mask"]]
+
+    missed_groups = groups.loc[missed.index]
+    false_groups = groups.loc[false.index]
+
+    missed_overload = (missed["ac_value"].abs() - missed["limit"]).clip(lower=0)
+    false_overload = (false["dc_value"].abs() - false["limit"]).clip(lower=0)
+
+    return {
+        "False Negatives Avg Overload (A)": (
+            missed_overload.groupby(missed_groups).mean().sort_values(ascending=False)
+        ),
+        "False Positives Avg Overload (A)": (
+            false_overload.groupby(false_groups).mean().sort_values(ascending=False)
+        ),
+        "False Negatives Avg Loading %": (
+            missed["ac_loading_pct"].groupby(missed_groups).mean().sort_values(ascending=False)
+        ),
+        "False Positives Avg Loading %": (
+            false["dc_loading_pct"].groupby(false_groups).mean().sort_values(ascending=False)
         ),
     }
 
@@ -426,6 +523,7 @@ def log_all_priority1_kpis(label: str, comparison: pd.DataFrame, id_col: pd.Seri
     if group_col is not None:
         rows += _report_per_co(label, "MAE (A)", mae_per_contingency(comparison, group_col))
         rows += _report_per_co(label, "RMSE (A)", rmse_per_contingency(comparison, group_col))
+        rows += _report_per_co(label, "Max Error (A)", max_error_per_contingency(comparison, group_col))
 
     loading_limit = loading_limit_kpis(comparison)
     log_kpi_table(f"{label} - Loading & Limit-Based KPIs", loading_limit)
@@ -446,6 +544,17 @@ def log_all_priority1_kpis(label: str, comparison: pd.DataFrame, id_col: pd.Seri
     log_kpi_table(f"{label} - Violation Detection KPIs", violation)
     rows += overall_rows(label, violation)
 
+    if group_col is not None:
+        counts = violation_counts_per_contingency(comparison, violation, group_col)
+        for name, count_per_co in counts.items():
+            rows += _report_per_co(label, name, count_per_co)
+        rates = violation_rates_per_contingency(comparison, violation, group_col)
+        for name, rate_per_co in rates.items():
+            if name.startswith("_"):
+                continue
+            rows += _report_per_co(label, name, rate_per_co)
+        rows += _report_rate_exclusions(label, rates)
+
     severity = severity_kpis(comparison, violation)
     log_kpi_table(f"{label} - Severity-Based KPIs", severity)
     rows += overall_rows(label, severity)
@@ -454,6 +563,9 @@ def log_all_priority1_kpis(label: str, comparison: pd.DataFrame, id_col: pd.Seri
         volumes = severity_volumes_per_contingency(comparison, violation, group_col)
         for name, volume_per_co in volumes.items():
             rows += _report_per_co(label, name, volume_per_co)
+        averages = severity_averages_per_contingency(comparison, violation, group_col)
+        for name, average_per_co in averages.items():
+            rows += _report_per_co(label, name, average_per_co)
 
     if id_col is not None:
         ranking = ranking_kpis(comparison, id_col, group_col)
@@ -462,6 +574,21 @@ def log_all_priority1_kpis(label: str, comparison: pd.DataFrame, id_col: pd.Seri
         rows += _report_top_n_overlap_per_co(label, ranking)
 
     return rows
+
+
+def _report_rate_exclusions(label: str, rates: dict) -> list:
+    """Log how many contingency groups each per-CO rate has no denominator for.
+
+    The counts stay in the log for the same reason the Top-N overlap's does: a rate covering
+    only part of the contingencies cannot be read without knowing how many it could not be
+    computed for. The groups are not named as the Top-N exclusions are - there is one per
+    secure contingency, which is most of them.
+    """
+    counts = {name: len(groups) for name, groups in (rates.get("_excluded_groups") or {}).items()}
+    if not counts:
+        return []
+    log_kpi_table(f"{label} - Per-CO Rate Coverage", counts)
+    return overall_rows(label, counts)
 
 
 def _report_top_n_overlap_per_co(label: str, ranking: dict) -> list:
