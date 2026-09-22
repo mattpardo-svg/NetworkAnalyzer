@@ -14,6 +14,7 @@ import seaborn as sns
 from rosc_acdc import (
     config,
     contingencies,
+    kpi_workbook,
     kpis,
     loadflow,
     logging_setup,
@@ -49,6 +50,17 @@ def main():
     ac_tr_i = loadflow.branch_current(hv_transformers)
     ac_tr3_i = loadflow.branch_current(hv_transformers3)
 
+    # The RCC elements never enter the base-case comparison, but they do enter the security
+    # analysis, and the KPI workbook has to attribute every element it reports to one
+    # country and voltage level. Captured here, before the DC load flow overwrites the
+    # network's AC current results.
+    ac_all_i = pd.concat([
+        ac_ln_i, ac_tr_i, ac_tr3_i,
+        loadflow.branch_current(rcc_lines),
+        loadflow.branch_current(rcc_transformers),
+        loadflow.branch_current(rcc_transformers3),
+    ])
+
     # --- DC load flow ---
     dc_result, dc_lf_time = loadflow.run_dc(network)
 
@@ -65,6 +77,13 @@ def main():
     dc_tr3_i = loadflow.branch_current_dc(hv_transformers3, voltage_levels)
 
     limits = network.get_loading_limits().reset_index()
+
+    # Each element is attributed to a single side for the KPI workbook's Country and
+    # VoltageLevel grouping keys - the side the base case already reports it on. The SA
+    # dataset keeps both sides as separate observations, which is correct and unchanged;
+    # this only decides which country and voltage level those observations are filed under,
+    # so a tie line does not land in two countries depending on the row.
+    binding_side = loadflow.binding_sides(ac_all_i, loadflow.permanent_current_limits(limits))
 
     (
         lines_cmp, transformers_cmp, transformers3_cmp,
@@ -112,10 +131,13 @@ def main():
     element_info.index.name = "subject_id"
 
     sa.add_monitored_elements(branch_ids=branch_ids, three_windings_transformer_ids=tr3_ids)
-    contingencies.add_contingencies_and_actions(sa, data, valid_ids)
+    # The contingency count is Perf_Computation's N_Contingencies: how many contingencies
+    # the security analysis actually ran, not how many the scenario file holds.
+    _missing, contingency_count = contingencies.add_contingencies_and_actions(sa, data, valid_ids)
 
     shortlist_con_mge = None
     sides_ac_all = None
+    sa_comparison = None
     patl_all = None
     con_analysis = ac_con_analysis = None
 
@@ -147,6 +169,29 @@ def main():
     kpis.log_kpi_table("Performance", performance)
     kpi_rows += kpis.overall_rows("Performance", performance)
     kpis.write_kpi_workbook(kpi_rows)
+
+    # --- KPI workbook (Core_AC_DC_KPI.xlsx) ---
+    # A second, differently-grained output written alongside kpi_results.xlsx above, not a
+    # replacement for it: this one reports N-0 + all-COs-combined per country and voltage
+    # level, that one keeps the full per-contingency series.
+    stage_times = [
+        ("AC Load Flow", "Load Flow", "AC", ac_lf_time),
+        ("DC Load Flow", "Load Flow", "DC", dc_lf_time),
+        ("AC Security Analysis", "Security Analysis", "AC", ac_con_analysis),
+        ("DC Security Analysis", "Security Analysis", "DC", con_analysis),
+    ]
+    kpi_workbook.build_and_write(
+        network,
+        network_io.element_locations(network, element_info, binding_side),
+        stage_times,
+        n_elements_evaluated=len(branch_ids) + len(tr3_ids),
+        n_contingencies=contingency_count,
+        base_case_comparison=base_case_comparison,
+        base_case_ids=pd.Series(base_case_df.index, index=base_case_df.index),
+        sa_comparison=sa_comparison,
+        sa_element_ids=None if sides_ac_all is None else sides_ac_all["subject_id"],
+        sa_contingency_ids=None if sides_ac_all is None else sides_ac_all["contingency_id"],
+    )
 
     if not config.RAO_RUN:
         return

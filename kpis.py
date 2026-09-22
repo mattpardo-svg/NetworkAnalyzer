@@ -8,20 +8,24 @@ import numpy as np
 import pandas as pd
 from prettytable import PrettyTable
 
+from rosc_acdc import config
 from rosc_acdc.paths import output_path
 
 logger = logging.getLogger(__name__)
 
-VIOLATION_THRESHOLD_PCT = 100
-NEAR_LIMIT_THRESHOLDS_PCT = (80, 90, 95)
-TOP_N_DEFAULT = 10
 BASE_CASE_GROUP_LABEL = "N-0 (base case)"
+
+# The three near-limit thresholds this study reported before the KPI workbook existed.
+# Core_AC_DC_KPI.xlsx carries exactly one near-limit column, at
+# config.KPI_NEAR_LIMIT_THRESHOLD_PCT; kpi_results.xlsx and the log keep all three, since
+# loading_limit_kpis() takes whatever thresholds it is handed and nothing was gained by
+# dropping two of them from an output that already had room.
+LEGACY_NEAR_LIMIT_THRESHOLDS_PCT = (80, 90, 95)
 
 # How many contingencies of each per-CO KPI the log summary shows. This governs the size of
 # the log only: every contingency is computed, and all of them reach the workbook below.
 PER_CO_LOG_SUMMARY_N = 5
 
-KPI_WORKBOOK_FILENAME = "kpi_results.xlsx"
 KPI_WORKBOOK_SHEET = "KPIs"
 OVERALL_LABEL = "Overall"
 
@@ -55,13 +59,21 @@ def prepare_comparison(df, ac_value_col, dc_value_col, limit_col,
         )
         out = out[paired]
 
-    out["abs_error"] = (out["dc_value"] - out["ac_value"]).abs()
+    out["signed_error"] = out["dc_value"] - out["ac_value"]
+    out["abs_error"] = out["signed_error"].abs()
     out["signed_loading_deviation"] = out["dc_loading_pct"] - out["ac_loading_pct"]
     out["margin_ac"] = out["limit"] - out["ac_value"].abs()
     out["margin_dc"] = out["limit"] - out["dc_value"].abs()
     out["signed_margin_error"] = out["margin_dc"] - out["margin_ac"]
-    out["ac_violation"] = out["ac_loading_pct"] > VIOLATION_THRESHOLD_PCT
-    out["dc_violation"] = out["dc_loading_pct"] > VIOLATION_THRESHOLD_PCT
+    # `>=`, not `>`: an element exactly at the threshold is in violation. This matches the
+    # near-limit selection below and the workbook spec's own wording ("in violation when
+    # loading >= this value"). It is a real behaviour change from the earlier `>`.
+    out["ac_violation"] = out["ac_loading_pct"] >= config.KPI_VIOLATION_THRESHOLD_PCT
+    out["dc_violation"] = out["dc_loading_pct"] >= config.KPI_VIOLATION_THRESHOLD_PCT
+    # Overload magnitude above the limit, per side of the comparison. Computed once here so
+    # the severity KPIs and their primitives read the same numbers.
+    out["ac_overload"] = (out["ac_value"].abs() - out["limit"]).clip(lower=0)
+    out["dc_overload"] = (out["dc_value"].abs() - out["limit"]).clip(lower=0)
     return out
 
 
@@ -139,14 +151,32 @@ def max_error_per_contingency(comparison: pd.DataFrame, group_col: pd.Series) ->
     return comparison["abs_error"].groupby(groups).max().sort_values(ascending=False)
 
 
-def loading_limit_kpis(comparison: pd.DataFrame) -> dict:
-    """Signed loading-% deviation and margin error (A), overall and near the thermal limit."""
+def near_limit_subset(comparison: pd.DataFrame, threshold_pct: float = None) -> pd.DataFrame:
+    """The observations whose AC loading reaches the near-limit threshold.
+
+    One place decides this population, so the near-limit KPI and its primitives
+    (N_NearLimit_Obs, Sum_NearLimit_LoadingDev_pp, N_NearLimit_Underest) cannot drift
+    apart. `>=` is deliberate and matches the violation test.
+    """
+    if threshold_pct is None:
+        threshold_pct = config.KPI_NEAR_LIMIT_THRESHOLD_PCT
+    return comparison[comparison["ac_loading_pct"] >= threshold_pct]
+
+
+def loading_limit_kpis(comparison: pd.DataFrame, thresholds_pct=None) -> dict:
+    """Signed loading-% deviation and margin error (A), overall and near the thermal limit.
+
+    `thresholds_pct` is any iterable of near-limit thresholds: the KPI workbook passes the
+    single configured one, the legacy log and workbook pass all three they always reported.
+    """
+    if thresholds_pct is None:
+        thresholds_pct = (config.KPI_NEAR_LIMIT_THRESHOLD_PCT,)
     kpis = {
         "Mean Loading % Deviation (DC-AC)": comparison["signed_loading_deviation"].mean(),
         "Mean Margin Error (DC-AC) (A)": comparison["signed_margin_error"].mean(),
     }
-    for threshold in NEAR_LIMIT_THRESHOLDS_PCT:
-        subset = comparison[comparison["ac_loading_pct"] >= threshold]
+    for threshold in thresholds_pct:
+        subset = near_limit_subset(comparison, threshold)
         kpis[f"Near-Limit ({threshold}%+) Mean Loading % Deviation"] = (
             subset["signed_loading_deviation"].mean() if not subset.empty else np.nan
         )
@@ -263,8 +293,8 @@ def severity_kpis(comparison: pd.DataFrame, violation: dict) -> dict:
     missed = comparison.loc[false_negatives]
     false = comparison.loc[false_positives]
 
-    missed_overload = (missed["ac_value"].abs() - missed["limit"]).clip(lower=0)
-    false_overload = (false["dc_value"].abs() - false["limit"]).clip(lower=0)
+    missed_overload = missed["ac_overload"]
+    false_overload = false["dc_overload"]
 
     return {
         "Missed Overload Volume (A)": missed_overload.sum(),
@@ -289,8 +319,8 @@ def severity_volumes_per_contingency(comparison: pd.DataFrame, violation: dict,
     missed = comparison.loc[violation["_false_negatives_mask"]]
     false = comparison.loc[violation["_false_positives_mask"]]
 
-    missed_overload = (missed["ac_value"].abs() - missed["limit"]).clip(lower=0)
-    false_overload = (false["dc_value"].abs() - false["limit"]).clip(lower=0)
+    missed_overload = missed["ac_overload"]
+    false_overload = false["dc_overload"]
 
     return {
         "Missed Overload Volume (A)": (
@@ -319,8 +349,8 @@ def severity_averages_per_contingency(comparison: pd.DataFrame, violation: dict,
     missed_groups = groups.loc[missed.index]
     false_groups = groups.loc[false.index]
 
-    missed_overload = (missed["ac_value"].abs() - missed["limit"]).clip(lower=0)
-    false_overload = (false["dc_value"].abs() - false["limit"]).clip(lower=0)
+    missed_overload = missed["ac_overload"]
+    false_overload = false["dc_overload"]
 
     return {
         "False Negatives Avg Overload (A)": (
@@ -339,20 +369,28 @@ def severity_averages_per_contingency(comparison: pd.DataFrame, violation: dict,
 
 
 def ranking_kpis(comparison: pd.DataFrame, id_col: pd.Series, group_col: pd.Series = None,
-                  top_n: int = TOP_N_DEFAULT) -> dict:
+                  top_n: int = None) -> dict:
     """Top-N critical element overlap and worst-case match rate, between AC and DC rankings.
 
-    When `group_col` is given (e.g. contingency_id), ranking is done per group
-    and the reported figures are averaged across groups; otherwise ranking is
-    global (base-case usage). Rows with no contingency (the N-state) form their
-    own group rather than being dropped.
+    When `group_col` is given (e.g. contingency_id), ranking is done per group and the
+    reported figures are pooled across groups; otherwise ranking is global (base-case
+    usage). Rows with no contingency (the N-state) form their own group rather than
+    being dropped.
+
+    The overall overlap is the pooled ratio `SUM(overlap count) / SUM(N)`, not the mean of
+    the per-group ratios. Those two differ whenever the groups are unequally sized, and
+    Dim_KPI's K16 formula is the pooled one - averaging pre-computed ratios is exactly what
+    the workbook's Rule 2 forbids. The summed numerator and denominator are returned as
+    `Top-N Overlap Count` and `TopN_N`, which are also the workbook's own primitive columns.
 
     The per-CO overlap values are returned under `_top_n_overlap_per_co` for reporting:
-    the specification asks for this KPI per CO and then averaged, and the average alone
-    hides which contingencies DC ranks differently. Groups with a single monitored element
-    cannot be ranked and are excluded; they are counted and named so the per-CO list is
-    visibly incomplete rather than silently so.
+    the average alone hides which contingencies DC ranks differently. Groups with a single
+    monitored element cannot be ranked and are excluded; they are counted and named so the
+    per-CO list is visibly incomplete rather than silently so.
     """
+    if top_n is None:
+        top_n = config.KPI_TOP_N
+
     df = comparison.copy()
     df["_id"] = id_col.reindex(df.index)
 
@@ -361,37 +399,106 @@ def ranking_kpis(comparison: pd.DataFrame, id_col: pd.Series, group_col: pd.Seri
             return None
         ac_top = set(group_df.nlargest(min(top_n, len(group_df)), "ac_loading_pct")["_id"])
         dc_top = set(group_df.nlargest(min(top_n, len(group_df)), "dc_loading_pct")["_id"])
-        overlap = len(ac_top & dc_top) / top_n  # per spec: divided by N, not by the group size
+        overlap_count = len(ac_top & dc_top)  # per spec: divided by N, not by the group size
         ac_worst = group_df.loc[group_df["ac_loading_pct"].idxmax(), "_id"]
         dc_worst = group_df.loc[group_df["dc_loading_pct"].idxmax(), "_id"]
-        return overlap, ac_worst == dc_worst
+        return overlap_count, ac_worst == dc_worst
 
     if group_col is not None:
         df["_group"] = _contingency_groups(df, group_col)
-        overlaps, matches, excluded = {}, [], []
+        overlaps, counts, matches, excluded = {}, 0, [], []
         for group, group_df in df.groupby("_group"):
             metrics = _group_metrics(group_df)
             if metrics is None:
                 excluded.append(group)
                 continue
-            overlaps[group] = metrics[0]
+            counts += metrics[0]
+            overlaps[group] = metrics[0] / top_n
             matches.append(metrics[1])
         # Lowest overlap first: those are the contingencies DC ranks least like AC.
         overlap_per_co = pd.Series(overlaps, dtype=float).sort_values()
+        denominator = len(overlap_per_co) * top_n
         return {
-            "Top-N Critical Element Overlap": np.nanmean(overlap_per_co) if len(overlap_per_co) else np.nan,
+            "Top-N Critical Element Overlap": counts / denominator if denominator else np.nan,
             "Worst-Case Match Rate": np.mean(matches) if matches else np.nan,
             "Contingency Groups Ranked": len(overlap_per_co),
             "Contingency Groups Excluded (<2 monitored elements)": len(excluded),
+            "_top_n_overlap_count": counts,
+            "_top_n_denominator": denominator,
+            "_worst_case_matches": int(np.sum(matches)) if matches else 0,
+            "_worst_case_total": len(matches),
             "_top_n_overlap_per_co": overlap_per_co,
             "_excluded_groups": excluded,
         }
 
     metrics = _group_metrics(df)
     if metrics is None:
-        return {"Top-N Critical Element Overlap": np.nan, "Worst-Case Match Rate": np.nan}
-    overlap, match = metrics
-    return {"Top-N Critical Element Overlap": overlap, "Worst-Case Match Rate": float(match)}
+        return {
+            "Top-N Critical Element Overlap": np.nan, "Worst-Case Match Rate": np.nan,
+            "_top_n_overlap_count": 0, "_top_n_denominator": 0,
+            "_worst_case_matches": 0, "_worst_case_total": 0,
+        }
+    overlap_count, match = metrics
+    return {
+        "Top-N Critical Element Overlap": overlap_count / top_n,
+        "Worst-Case Match Rate": float(match),
+        "_top_n_overlap_count": overlap_count,
+        "_top_n_denominator": top_n,
+        "_worst_case_matches": int(match),
+        "_worst_case_total": 1,
+    }
+
+
+def element_ranking_kpis(comparison: pd.DataFrame, id_col: pd.Series,
+                          top_n: int = None) -> dict:
+    """Top-N overlap and worst-case match for one KPI_Data row, ranked over its elements.
+
+    One ranking per row, not one per contingency: `TopN_N` is the configured N on every
+    row regardless of Case, so the numerator has to be a single group's overlap count for
+    `SUM(TopN_Overlap_Count) / SUM(TopN_N)` to stay in range when rows are rolled up.
+
+    Elements are ranked on their worst loading within the row's population. An element
+    appearing under several contingencies would otherwise occupy several of the N slots
+    and collapse the comparison to a handful of distinct elements.
+
+    `WorstCase_Match_Rate` is therefore 0 or 1 here - whether AC and DC agree on this
+    row's single most loaded element. That is consistent with the two primitives
+    `02_kpi_data_schema.md` records as missing for K17, `WorstCase_Match_Flag` and
+    `WorstCase_Total`: a flag and a count are what a roll-up of it would need.
+    """
+    if top_n is None:
+        top_n = config.KPI_TOP_N
+
+    unrankable = {
+        "TopN_Overlap_Count": np.nan, "TopN_N": top_n,
+        "TopN_Overlap_Rate": np.nan, "WorstCase_Match_Rate": np.nan,
+    }
+    if comparison.empty:
+        return unrankable
+
+    elements = pd.DataFrame({
+        "ac_loading_pct": comparison["ac_loading_pct"],
+        "dc_loading_pct": comparison["dc_loading_pct"],
+        "_id": id_col.reindex(comparison.index),
+    }).groupby("_id")[["ac_loading_pct", "dc_loading_pct"]].max()
+
+    if len(elements) < 2:
+        return unrankable
+
+    ac_top = set(elements.nlargest(min(top_n, len(elements)), "ac_loading_pct").index)
+    dc_top = set(elements.nlargest(min(top_n, len(elements)), "dc_loading_pct").index)
+    overlap_count = len(ac_top & dc_top)
+
+    return {
+        "TopN_Overlap_Count": overlap_count,
+        "TopN_N": top_n,
+        # Divided by N, as the specification defines it - not by the number of elements
+        # ranked, so a population smaller than N cannot reach 1.0.
+        "TopN_Overlap_Rate": overlap_count / top_n,
+        "WorstCase_Match_Rate": float(
+            elements["ac_loading_pct"].idxmax() == elements["dc_loading_pct"].idxmax()
+        ),
+    }
 
 
 def _speed_up(ac_time, dc_time):
@@ -480,19 +587,25 @@ def _report_per_co(dataset: str, kpi_name: str, values: pd.Series, descriptor: s
     summary = values.head(PER_CO_LOG_SUMMARY_N)
     log_kpi_table(
         f"{dataset} - {kpi_name} per Contingency, {descriptor} {len(summary)} of "
-        f"{len(values)} (full detail in {KPI_WORKBOOK_FILENAME})",
+        f"{len(values)} (full detail in {config.LEGACY_KPI_WORKBOOK_FILENAME})",
         summary.to_dict(),
     )
     return per_co_rows(dataset, kpi_name, values)
 
 
-def write_kpi_workbook(rows: list, filename: str = KPI_WORKBOOK_FILENAME) -> str:
+def write_kpi_workbook(rows: list, filename: str = None) -> str:
     """Write every collected KPI result to one sheet under output/, and return the path.
 
     One combined sheet rather than one per KPI: the overall and per-CO rows of a KPI stay
     together and the Contingency column separates them, so the whole record can be filtered
     or pivoted in one place. This is the complete record; the log is a summary of it.
+
+    This is the per-contingency detail workbook, and it is not superseded by
+    Core_AC_DC_KPI.xlsx: that one reports N-0 + all-COs-combined only, so the per-CO
+    series below exists nowhere else. Both are written by every run.
     """
+    if filename is None:
+        filename = config.LEGACY_KPI_WORKBOOK_FILENAME
     if not rows:
         logger.warning("No KPI results collected, %s not written", filename)
         return None
@@ -525,7 +638,9 @@ def log_all_priority1_kpis(label: str, comparison: pd.DataFrame, id_col: pd.Seri
         rows += _report_per_co(label, "RMSE (A)", rmse_per_contingency(comparison, group_col))
         rows += _report_per_co(label, "Max Error (A)", max_error_per_contingency(comparison, group_col))
 
-    loading_limit = loading_limit_kpis(comparison)
+    # All three legacy thresholds, not the single configured one: this workbook and its log
+    # have always carried 80/90/95 and nothing is gained by narrowing them here.
+    loading_limit = loading_limit_kpis(comparison, LEGACY_NEAR_LIMIT_THRESHOLDS_PCT)
     log_kpi_table(f"{label} - Loading & Limit-Based KPIs", loading_limit)
     rows += overall_rows(label, loading_limit)
 
@@ -574,6 +689,146 @@ def log_all_priority1_kpis(label: str, comparison: pd.DataFrame, id_col: pd.Seri
         rows += _report_top_n_overlap_per_co(label, ranking)
 
     return rows
+
+
+# ---------------------------------------------------------------------------
+# Raw primitives for Core_AC_DC_KPI.xlsx
+#
+# Every ratio KPI in KPI_Data is paired with the counts and sums behind it, because a
+# consumer aggregating beyond that table's grain has to re-derive the ratio from summed
+# primitives rather than average pre-computed ratios (the workbook's Rule 2). Nothing
+# below is a new measurement: these are the intermediate values the KPI functions above
+# already compute and then divide away.
+# ---------------------------------------------------------------------------
+
+
+def contingency_count(group_col: pd.Series) -> int:
+    """Distinct contingencies behind a population; the intact state is not one of them."""
+    if group_col is None:
+        return 0
+    return int(group_col.dropna().nunique())
+
+
+def raw_primitives(comparison: pd.DataFrame, violation: dict, id_col: pd.Series = None,
+                    group_col: pd.Series = None) -> dict:
+    """The counts and sums KPI_Data carries alongside its computed KPIs."""
+    false_negatives = violation["_false_negatives_mask"]
+    false_positives = violation["_false_positives_mask"]
+    ac_violation = comparison["ac_violation"]
+    dc_violation = comparison["dc_violation"]
+
+    return {
+        "N_Obs": int(len(comparison)),
+        "N_CO": contingency_count(group_col),
+        "N_Elements": int(id_col.reindex(comparison.index).nunique()) if id_col is not None else 0,
+        "Sum_AbsErr_A": comparison["abs_error"].sum(),
+        "Sum_SqErr_A": (comparison["abs_error"] ** 2).sum(),
+        "Sum_SignedErr_A": comparison["signed_error"].sum(),
+        "Max_AbsErr_A": comparison["abs_error"].max() if len(comparison) else np.nan,
+        "Sum_LoadingDev_pp": comparison["signed_loading_deviation"].sum(),
+        "Sum_MarginDev_A": comparison["signed_margin_error"].sum(),
+        "N_AC_Viol": int(ac_violation.sum()),
+        "N_DC_Viol": int(dc_violation.sum()),
+        # N_TN is not the existing ac_secure_count: that one is TN + FP.
+        "N_TP": int((ac_violation & dc_violation).sum()),
+        "N_TN": int((~ac_violation & ~dc_violation).sum()),
+        "Sum_MissedOverload_A": comparison.loc[false_negatives, "ac_overload"].sum(),
+        "Sum_FalseOverload_A": comparison.loc[false_positives, "dc_overload"].sum(),
+        "Sum_FN_Loading_AC_pct": comparison.loc[false_negatives, "ac_loading_pct"].sum(),
+        "Sum_FP_Loading_DC_pct": comparison.loc[false_positives, "dc_loading_pct"].sum(),
+    }
+
+
+def near_limit_kpis(comparison: pd.DataFrame, threshold_pct: float = None) -> dict:
+    """The near-limit KPI at one threshold, with the primitives that let it be re-derived.
+
+    An "underestimation" is an observation where DC reports a lower loading than AC: the
+    error that matters near the limit, because it is the one that hides an overload.
+    """
+    subset = near_limit_subset(comparison, threshold_pct)
+    deviation = subset["signed_loading_deviation"]
+    return {
+        "Sum_NearLimit_LoadingDev_pp": deviation.sum(),
+        "N_NearLimit_Obs": int(len(subset)),
+        "NearLimit_Mean_LoadingDev_pp": deviation.mean() if len(subset) else np.nan,
+        "N_NearLimit_Underest": int((deviation < 0).sum()),
+        "NearLimit_Underest_Rate": (
+            float((deviation < 0).sum()) / len(subset) if len(subset) else np.nan
+        ),
+    }
+
+
+def co_level_kpis(comparison: pd.DataFrame, group_col: pd.Series = None) -> dict:
+    """The contingency-level (K21-K23) KPIs: criticality agreement and worst-CO severity.
+
+    A contingency is "critical" when at least one of its observations is in violation. The
+    rates below therefore count contingencies, not elements, which is what separates these
+    from the element-level Missed Overload / False Alarm rates.
+
+    Only real contingencies take part: intact-state observations carry no contingency id
+    and are dropped here, so the All case's base-case half cannot be counted as a CO.
+
+    Formulas follow Dim_KPI's K21, K22 and K23 exactly:
+
+        K21 = N_CO_MissedCritical / N_CO_AC_Viol
+        K22 = N_CO_FalseCritical / (N_CO - N_CO_AC_Viol)
+        K23 = Sum_WorstCO_SevDev_A / N_CO_SevDev_Obs
+
+    The CO-level primitives those formulas name are returned under private keys. They are
+    deliberately **not** written to KPI_Data: `02_kpi_data_schema.md` fixes that schema and
+    records these columns as absent, so these four KPIs ship at their native grain only and
+    no roll-up beyond it is possible - or is to be attempted.
+    """
+    empty = {
+        "Missed_Critical_CO_Rate": np.nan,
+        "False_Critical_CO_Rate": np.nan,
+        "Mean_WorstCO_SevDev_A": np.nan,
+        "_n_co": 0, "_n_co_ac_viol": 0, "_n_co_missed_critical": 0,
+        "_n_co_false_critical": 0, "_sum_worstco_sevdev_a": np.nan, "_n_co_sevdev_obs": 0,
+    }
+    if group_col is None:
+        return empty
+
+    groups = group_col.reindex(comparison.index)
+    per_co = comparison[groups.notna()]
+    if per_co.empty:
+        return empty
+    labels = groups[groups.notna()]
+
+    ac_critical = per_co["ac_violation"].groupby(labels).any()
+    dc_critical = per_co["dc_violation"].groupby(labels).any()
+
+    n_co = int(len(ac_critical))
+    n_co_ac_viol = int(ac_critical.sum())
+    n_co_ac_secure = n_co - n_co_ac_viol
+    n_missed = int((ac_critical & ~dc_critical).sum())
+    n_false = int((~ac_critical & dc_critical).sum())
+
+    # Worst overload severity in a contingency, AC vs DC. "Overload severity" is the
+    # magnitude above the limit and never below zero - the same ac_overload / dc_overload
+    # the volume KPIs are built from - so a contingency neither AC nor DC overloads
+    # contributes a deviation of zero rather than a margin.
+    worst_ac = per_co["ac_overload"].groupby(labels).max()
+    worst_dc = per_co["dc_overload"].groupby(labels).max()
+    severity_deviation = worst_dc - worst_ac
+    sum_severity_deviation = severity_deviation.sum()
+    n_severity_observations = int(len(severity_deviation))
+
+    return {
+        "Missed_Critical_CO_Rate": n_missed / n_co_ac_viol if n_co_ac_viol else np.nan,
+        # Denominator is the AC-secure contingencies, mirroring K11's false alarm rate.
+        "False_Critical_CO_Rate": n_false / n_co_ac_secure if n_co_ac_secure else np.nan,
+        "Mean_WorstCO_SevDev_A": (
+            sum_severity_deviation / n_severity_observations if n_severity_observations
+            else np.nan
+        ),
+        "_n_co": n_co,
+        "_n_co_ac_viol": n_co_ac_viol,
+        "_n_co_missed_critical": n_missed,
+        "_n_co_false_critical": n_false,
+        "_sum_worstco_sevdev_a": sum_severity_deviation,
+        "_n_co_sevdev_obs": n_severity_observations,
+    }
 
 
 def _report_rate_exclusions(label: str, rates: dict) -> list:

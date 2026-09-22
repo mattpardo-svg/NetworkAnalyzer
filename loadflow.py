@@ -73,6 +73,36 @@ def branch_current_dc(elements_df, voltage_levels):
     return _by_side(currents)
 
 
+def permanent_current_limits(limits):
+    """One permanent CURRENT rating per (element_id, side); the most restrictive wins.
+
+    CIM current limits are terminal-specific, so a branch can be rated differently on each
+    side. Only CURRENT-type permanent limits are selected: comparing a current against an
+    MVA or MW rating would corrupt every loading, margin and violation flag derived from it.
+    """
+    patl = limits[(limits["acceptable_duration"] == -1) & (limits["type"] == "CURRENT")]
+    return patl.groupby(["element_id", "side"])["value"].min()
+
+
+def binding_sides(ac_currents, patl_per_side):
+    """element_id -> the side whose AC loading against its own PATL is highest.
+
+    The same rule `_compare_ac_dc()` applies below, extracted so it can be asked of any
+    element rather than only the ones that reach the base-case comparison. The KPI
+    workbook needs it for the SA population too: an SA row exists per (element, side), but
+    the element has to be attributed to a single country and voltage level for grouping,
+    and the binding side is the choice the base case already makes.
+
+    Computed before any loading filter, so lightly loaded elements still resolve. An
+    element with no rated side at all is absent from the result; the caller decides what
+    to do with it.
+    """
+    loading = ac_currents.div(patl_per_side.reindex(ac_currents.index)).dropna()
+    if loading.empty:
+        return pd.Series(dtype=object)
+    return loading.groupby(level="element_id").idxmax().map(lambda key: key[1])
+
+
 def _compare_ac_dc(ac_currents, dc_currents, patl_per_side, name_lookup, active_threshold_pct,
                     kind_label):
     """Build the AC/DC comparison dataframe for one element type (lines, 2W-TR, 3W-TR).
@@ -128,9 +158,8 @@ def build_base_case_comparison(limits, hv_lines, hv_transformers, hv_transformer
     most of all, where the two ratings express the same MVA at different voltages - and
     side ONE is not reliably the side that binds.
     """
-    patl = limits[(limits["acceptable_duration"] == -1) & (limits["type"] == "CURRENT")]
     # One PATL per (element, side); the most restrictive rating wins if a side carries several.
-    patl_per_side = patl.groupby(["element_id", "side"])["value"].min()
+    patl_per_side = permanent_current_limits(limits)
 
     lines_cmp, final_lines_id = _compare_ac_dc(
         ac_ln_i, dc_ln_i, patl_per_side, hv_lines, config.BASE_CASE_ACTIVE_THRESHOLD_PCT, "line",
